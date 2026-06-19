@@ -50,10 +50,12 @@ class AgentRunner:
         self.name  = self.meta.get("name", os.path.basename(md_path))
         self.model = self.meta.get("model", self.DEFAULT_MODEL)
 
-        # Initialise Anthropic client (reads ANTHROPIC_API_KEY from env)
-        self.client = anthropic.Anthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY", "")
-        )
+        # Initialise Anthropic client — supports OpenRouter via ANTHROPIC_BASE_URL
+        client_kwargs = {"api_key": os.environ.get("ANTHROPIC_API_KEY", "")}
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = anthropic.Anthropic(**client_kwargs)
 
     def run(self, user_message: str, max_tokens: int = 2048) -> str:
         """
@@ -79,17 +81,43 @@ class AgentRunner:
 
     def run_json(self, user_message: str, max_tokens: int = 2048) -> dict:
         """
-        Like run() but parses the response as JSON.
-        Strips markdown code fences if Claude wraps the JSON in them.
+        Like run() but extracts and parses the first JSON object in the response.
+        Handles all Claude output patterns:
+          - bare JSON
+          - ```json ... ``` fenced block
+          - JSON followed by extra explanation text
         """
         raw = self.run(user_message, max_tokens)
 
-        # Strip ```json ... ``` fences if present
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw.strip())
+        # 1. Try a fenced ```json ... ``` block first
+        fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
+        if fence_match:
+            candidate = fence_match.group(1)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
 
+        # 2. Extract the first { ... } block by brace counting
+        start = raw.find("{")
+        if start != -1:
+            depth = 0
+            for i, ch in enumerate(raw[start:], start):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            break
+
+        # 3. Last resort — try the whole stripped response
+        stripped = raw.strip()
         try:
-            return json.loads(raw)
+            return json.loads(stripped)
         except json.JSONDecodeError as e:
             if self.tracer:
                 self.tracer.log(agent=self.name, message=f"JSON parse error: {e}", level="ERROR")
