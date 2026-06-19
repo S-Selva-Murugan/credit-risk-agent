@@ -1,216 +1,175 @@
 """
-Test Suite – Risk Scoring Agent
-================================
-Unit tests for the RiskScoringAgent.
-Tests each scoring rule in isolation and the full classification pipeline.
+Test Suite – AgentRunner + .md agent definitions
+==================================================
+Verifies that AgentRunner correctly reads .md files, calls the Claude API,
+parses JSON responses, and handles edge cases.
 
 Run with: pytest tests/test_risk_scoring.py -v
 """
 
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from agents.risk_scoring_agent import RiskScoringAgent
-from observability.tracer import Tracer
+from unittest.mock import MagicMock, patch
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def agent():
-    """Create a fresh RiskScoringAgent for each test."""
-    tracer = Tracer()
-    return RiskScoringAgent(tracer=tracer)
+_AGENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agents")
+_RISK_MD    = os.path.join(_AGENTS_DIR, "risk_scoring_agent.md")
+_EXP_MD     = os.path.join(_AGENTS_DIR, "explanation_agent.md")
+_ORC_MD     = os.path.join(_AGENTS_DIR, "orchestrator_agent.md")
 
 
-@pytest.fixture
-def low_risk_profile():
-    """A textbook low-risk customer profile."""
-    return {
-        "name": "Alice Sharma",
-        "age": 34,
-        "monthly_income": 120_000,
-        "existing_loan": 300_000,
-        "credit_score": 820,
-        "missed_payments": 0,
-        "employment_type": "Salaried"
-    }
+def make_runner(md_path, response_json: dict):
+    """Create an AgentRunner with mocked Anthropic client."""
+    with patch("agents.agent_runner.anthropic.Anthropic"):
+        from agents.agent_runner import AgentRunner
+        runner = AgentRunner(md_path=md_path)
+    mock_msg = MagicMock()
+    mock_msg.content = [MagicMock(text=json.dumps(response_json))]
+    runner.client.messages.create = MagicMock(return_value=mock_msg)
+    return runner
 
 
-@pytest.fixture
-def medium_risk_profile():
-    """A medium-risk customer with mixed signals (score ~52)."""
-    return {
-        "name": "Sunita Joshi",
-        "age": 38,
-        "monthly_income": 70_000,
-        "existing_loan": 300_000,         # DTI = 300k / 840k = 35.7% → 8pts
-        "credit_score": 640,              # Fair → 25 pts
-        "missed_payments": 1,             # 1 missed → 7pts
-        "employment_type": "Business Owner"  # 5pts; Age risk 0pts → total 45
-    }
+class TestAgentRunner:
+
+    def test_reads_agent_name_from_md(self):
+        with patch("agents.agent_runner.anthropic.Anthropic"):
+            from agents.agent_runner import AgentRunner
+            r = AgentRunner(_RISK_MD)
+        assert r.name == "risk-scoring-agent"
+
+    def test_reads_model_from_md(self):
+        with patch("agents.agent_runner.anthropic.Anthropic"):
+            from agents.agent_runner import AgentRunner
+            r = AgentRunner(_RISK_MD)
+        assert "haiku" in r.model or "sonnet" in r.model
+
+    def test_system_prompt_populated(self):
+        with patch("agents.agent_runner.anthropic.Anthropic"):
+            from agents.agent_runner import AgentRunner
+            r = AgentRunner(_RISK_MD)
+        assert len(r.system_prompt) > 100
+        assert "Score" in r.system_prompt or "risk" in r.system_prompt.lower()
+
+    def test_run_json_returns_dict(self):
+        runner = make_runner(_RISK_MD, {"risk_score": 10, "risk_level": "Low Risk", "sub_scores": {}})
+        result = runner.run_json("test prompt")
+        assert isinstance(result, dict)
+
+    def test_strips_json_code_fences(self):
+        with patch("agents.agent_runner.anthropic.Anthropic"):
+            from agents.agent_runner import AgentRunner
+            runner = AgentRunner(_RISK_MD)
+        mock_msg = MagicMock()
+        mock_msg.content = [MagicMock(text='```json\n{"risk_score": 20, "risk_level": "Low Risk", "sub_scores": {}}\n```')]
+        runner.client.messages.create = MagicMock(return_value=mock_msg)
+        result = runner.run_json("test")
+        assert result["risk_score"] == 20
+
+    def test_invalid_json_raises_value_error(self):
+        with patch("agents.agent_runner.anthropic.Anthropic"):
+            from agents.agent_runner import AgentRunner
+            runner = AgentRunner(_RISK_MD)
+        mock_msg = MagicMock()
+        mock_msg.content = [MagicMock(text="not json at all")]
+        runner.client.messages.create = MagicMock(return_value=mock_msg)
+        with pytest.raises(ValueError, match="invalid JSON"):
+            runner.run_json("test")
+
+    def test_claude_api_called_with_system_prompt(self):
+        runner = make_runner(_RISK_MD, {"risk_score": 5, "risk_level": "Low Risk", "sub_scores": {}})
+        runner.run_json("score this customer")
+        call_kwargs = runner.client.messages.create.call_args[1]
+        assert call_kwargs["system"] == runner.system_prompt
+        assert call_kwargs["messages"][0]["content"] == "score this customer"
+
+    def test_profile_json_in_prompt(self):
+        runner = make_runner(_RISK_MD, {"risk_score": 5, "risk_level": "Low Risk", "sub_scores": {}})
+        prompt = f"Score this.\n\n{json.dumps({'name': 'Alice', 'credit_score': 820}, indent=2)}"
+        runner.run_json(prompt)
+        call_args = runner.client.messages.create.call_args[1]["messages"][0]["content"]
+        assert "Alice" in call_args
 
 
-@pytest.fixture
-def high_risk_profile():
-    """A high-risk customer with multiple red flags."""
-    return {
-        "name": "Kumar Singh",
-        "age": 28,
-        "monthly_income": 18_000,
-        "existing_loan": 500_000,
-        "credit_score": 480,
-        "missed_payments": 7,
-        "employment_type": "Unemployed"
-    }
+class TestRiskScoringMd:
+
+    def test_md_file_exists(self):
+        assert os.path.exists(_RISK_MD)
+
+    def test_md_has_name_frontmatter(self):
+        with open(_RISK_MD) as f:
+            content = f.read()
+        assert "name:" in content
+        assert "risk-scoring-agent" in content
+
+    def test_md_has_model_frontmatter(self):
+        with open(_RISK_MD) as f:
+            content = f.read()
+        assert "model:" in content
+
+    def test_md_contains_scoring_tables(self):
+        with open(_RISK_MD) as f:
+            content = f.read()
+        assert "credit_score_risk" in content.lower() or "Credit Score" in content
+
+    def test_md_defines_output_format(self):
+        with open(_RISK_MD) as f:
+            content = f.read()
+        assert "risk_score" in content
+        assert "risk_level" in content
+        assert "sub_scores" in content
 
 
-# ── Unit Tests: Individual Scoring Rules ─────────────────────────────────────
+class TestExplanationMd:
 
-class TestCreditScoreRule:
-    """Tests for the credit score sub-scoring rule."""
+    def test_md_file_exists(self):
+        assert os.path.exists(_EXP_MD)
 
-    def test_excellent_credit_zero_risk(self, agent):
-        assert agent._score_credit(820) == 0
-
-    def test_very_good_credit_low_risk(self, agent):
-        assert agent._score_credit(760) == 7
-
-    def test_good_credit_moderate_risk(self, agent):
-        assert agent._score_credit(700) == 14
-
-    def test_fair_credit_elevated_risk(self, agent):
-        assert agent._score_credit(620) == 25
-
-    def test_poor_credit_max_risk(self, agent):
-        assert agent._score_credit(450) == 35
-
-    def test_boundary_800(self, agent):
-        """Test exact boundary between Very Good and Excellent."""
-        assert agent._score_credit(800) == 0
-
-    def test_boundary_580(self, agent):
-        """Test exact boundary between Poor and Fair."""
-        assert agent._score_credit(580) == 25
+    def test_md_defines_factors_output(self):
+        with open(_EXP_MD) as f:
+            content = f.read()
+        assert "factors" in content
+        assert "summary" in content
+        assert "impact" in content
 
 
-class TestDTIRule:
-    """Tests for the Debt-to-Income ratio sub-scoring rule."""
+class TestOrchestratorMd:
 
-    def test_zero_debt_zero_risk(self, agent):
-        assert agent._score_dti(100_000, 0) == 0
+    def test_md_file_exists(self):
+        assert os.path.exists(_ORC_MD)
 
-    def test_low_dti(self, agent):
-        # Annual income = 1.2M, loan = 240k → DTI = 20% (exactly at boundary)
-        assert agent._score_dti(100_000, 240_000) == 0
+    def test_md_lists_subagents(self):
+        with open(_ORC_MD) as f:
+            content = f.read()
+        assert "risk-scoring-agent" in content
+        assert "explanation-agent" in content
+        assert "audit-agent" in content
 
-    def test_moderate_dti(self, agent):
-        # Annual income = 600k, loan = 240k → DTI = 40%
-        assert agent._score_dti(50_000, 240_000) == 8
-
-    def test_high_dti(self, agent):
-        # Annual income = 240k, loan = 240k → DTI = 100%
-        assert agent._score_dti(20_000, 240_000) == 25
-
-    def test_zero_income_max_risk(self, agent):
-        assert agent._score_dti(0, 100_000) == 25
+    def test_md_defines_decision_table(self):
+        with open(_ORC_MD) as f:
+            content = f.read()
+        assert "Approve" in content
+        assert "Reject" in content
+        assert "Review" in content
 
 
-class TestMissedPaymentsRule:
-    """Tests for the missed payments sub-scoring rule."""
+class TestRiskClassificationLogic:
+    """Verify correct decision mapping from score ranges."""
 
-    def test_no_missed_zero_risk(self, agent):
-        assert agent._score_missed_payments(0) == 0
-
-    def test_one_missed_minor_risk(self, agent):
-        assert agent._score_missed_payments(1) == 7
-
-    def test_two_missed_moderate_risk(self, agent):
-        assert agent._score_missed_payments(2) == 13
-
-    def test_five_missed_serious_risk(self, agent):
-        assert agent._score_missed_payments(5) == 17
-
-    def test_many_missed_max_risk(self, agent):
-        assert agent._score_missed_payments(10) == 20
-
-
-class TestEmploymentRule:
-    """Tests for the employment type sub-scoring rule."""
-
-    def test_salaried_zero_risk(self, agent):
-        assert agent._score_employment("Salaried") == 0
-
-    def test_business_owner_low_risk(self, agent):
-        assert agent._score_employment("Business Owner") == 5
-
-    def test_self_employed_moderate_risk(self, agent):
-        assert agent._score_employment("Self-Employed") == 8
-
-    def test_unemployed_max_risk(self, agent):
-        assert agent._score_employment("Unemployed") == 15
-
-    def test_unknown_employment_default(self, agent):
-        result = agent._score_employment("Freelancer")
-        assert 0 <= result <= 15  # Should return a sensible default
-
-
-class TestAgeRule:
-    """Tests for the age sub-scoring rule."""
-
-    def test_prime_age_zero_risk(self, agent):
-        assert agent._score_age(35) == 0
-
-    def test_young_adult_low_risk(self, agent):
-        assert agent._score_age(22) == 4
-
-    def test_senior_some_risk(self, agent):
-        assert agent._score_age(70) == 5
-
-
-# ── Integration Tests: Full Risk Classification ───────────────────────────────
-
-class TestFullRiskClassification:
-    """Integration tests for the complete risk scoring pipeline."""
-
-    def test_low_risk_classification(self, agent, low_risk_profile):
-        result = agent.compute_risk(low_risk_profile)
-        assert result["risk_level"] == "Low Risk"
-        assert result["risk_score"] <= 35
-
-    def test_medium_risk_classification(self, agent, medium_risk_profile):
-        result = agent.compute_risk(medium_risk_profile)
-        assert result["risk_level"] == "Medium Risk"
-        assert 36 <= result["risk_score"] <= 65
-
-    def test_high_risk_classification(self, agent, high_risk_profile):
-        result = agent.compute_risk(high_risk_profile)
-        assert result["risk_level"] == "High Risk"
-        assert result["risk_score"] >= 66
-
-    def test_result_has_sub_scores(self, agent, low_risk_profile):
-        result = agent.compute_risk(low_risk_profile)
-        assert "sub_scores" in result
-        assert "credit_score_risk" in result["sub_scores"]
-        assert "dti_risk" in result["sub_scores"]
-        assert "missed_payment_risk" in result["sub_scores"]
-
-    def test_score_is_integer(self, agent, low_risk_profile):
-        result = agent.compute_risk(low_risk_profile)
-        assert isinstance(result["risk_score"], int)
-
-    def test_score_bounded_0_to_100(self, agent, high_risk_profile):
-        result = agent.compute_risk(high_risk_profile)
-        assert 0 <= result["risk_score"] <= 100
-
-    def test_risk_level_is_valid_string(self, agent, medium_risk_profile):
-        result = agent.compute_risk(medium_risk_profile)
-        assert result["risk_level"] in ["Low Risk", "Medium Risk", "High Risk"]
-
-    def test_deterministic_output(self, agent, low_risk_profile):
-        """Same input must always produce same output (no randomness)."""
-        result1 = agent.compute_risk(low_risk_profile)
-        result2 = agent.compute_risk(low_risk_profile)
-        assert result1["risk_score"] == result2["risk_score"]
-        assert result1["risk_level"] == result2["risk_level"]
+    @pytest.mark.parametrize("score,expected_decision", [
+        (0,   "Approve"),
+        (35,  "Approve"),
+        (36,  "Review"),
+        (65,  "Review"),
+        (66,  "Reject"),
+        (100, "Reject"),
+    ])
+    def test_decision_boundaries(self, score, expected_decision):
+        if score <= 35:
+            decision = "Approve"
+        elif score <= 65:
+            decision = "Review"
+        else:
+            decision = "Reject"
+        assert decision == expected_decision

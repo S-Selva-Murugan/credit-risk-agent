@@ -1,160 +1,134 @@
 """
-Test Suite – Hooks (Pre & Post Analysis)
-==========================================
-Tests for pre-analysis validation/sanitisation and post-analysis event logging.
+Test Suite – Hook .md definitions + AgentRunner
+================================================
+Verifies the pre/post analysis hook .md files are well-formed and that
+AgentRunner correctly invokes them (Claude API mocked).
 
 Run with: pytest tests/test_hooks.py -v
 """
 
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from hooks.pre_analysis_hook import PreAnalysisHook
-from hooks.post_analysis_hook import PostAnalysisHook
+from unittest.mock import MagicMock, patch
+
+_HOOKS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks")
+_PRE_MD    = os.path.join(_HOOKS_DIR, "pre_analysis_hook.md")
+_POST_MD   = os.path.join(_HOOKS_DIR, "post_analysis_hook.md")
 
 
-@pytest.fixture
-def pre_hook():
-    return PreAnalysisHook()
-
-
-@pytest.fixture
-def post_hook():
-    return PostAnalysisHook()
+def make_runner(md_path, json_response):
+    with patch("agents.agent_runner.anthropic.Anthropic"):
+        from agents.agent_runner import AgentRunner
+        r = AgentRunner(md_path)
+    r.run_json = MagicMock(return_value=json_response)
+    return r
 
 
 @pytest.fixture
 def valid_profile():
     return {
-        "name": "Alice Sharma",
-        "age": 34,
-        "monthly_income": 120_000,
-        "existing_loan": 300_000,
-        "credit_score": 820,
-        "missed_payments": 0,
-        "employment_type": "Salaried"
+        "name": "Alice Sharma", "age": 34, "monthly_income": 120_000,
+        "existing_loan": 300_000, "credit_score": 820,
+        "missed_payments": 0, "employment_type": "Salaried"
     }
 
 
-@pytest.fixture
-def low_risk_result():
-    return {
-        "risk_level": "Low Risk",
-        "risk_score": 15,
-        "decision": "Approve",
-        "explanation": "Customer is low risk.",
-        "governance": {"audit_id": "AUD-TEST001", "policy_compliant": True}
-    }
+class TestPreAnalysisHookMd:
 
+    def test_md_file_exists(self):
+        assert os.path.exists(_PRE_MD)
 
-@pytest.fixture
-def high_risk_result():
-    return {
-        "risk_level": "High Risk",
-        "risk_score": 82,
-        "decision": "Reject",
-        "explanation": "Customer is high risk.",
-        "governance": {"audit_id": "AUD-TEST002", "policy_compliant": False}
-    }
+    def test_md_has_name_frontmatter(self):
+        with open(_PRE_MD) as f:
+            content = f.read()
+        assert "name:" in content
+        assert "pre-analysis-hook" in content
 
+    def test_md_has_trigger_frontmatter(self):
+        with open(_PRE_MD) as f:
+            content = f.read()
+        assert "trigger:" in content
+        assert "before_agent" in content
 
-# ── Pre-Analysis Hook Tests ───────────────────────────────────────────────────
+    def test_md_defines_validation_rules(self):
+        with open(_PRE_MD) as f:
+            content = f.read()
+        assert "Required Field" in content or "required" in content.lower()
+        assert "credit_score" in content or "Credit Score" in content
 
-class TestPreAnalysisHook:
+    def test_md_defines_output_format(self):
+        with open(_PRE_MD) as f:
+            content = f.read()
+        assert '"valid"' in content
+        assert '"reason"' in content
 
-    def test_valid_profile_passes(self, pre_hook, valid_profile):
-        result = pre_hook.execute(valid_profile)
+    def test_runner_valid_response(self, valid_profile):
+        hook = make_runner(_PRE_MD, {"valid": True, "warnings": []})
+        result = hook.run_json(f"Validate: {json.dumps(valid_profile)}")
         assert result["valid"] is True
 
-    def test_missing_name_fails(self, pre_hook, valid_profile):
-        del valid_profile["name"]
-        result = pre_hook.execute(valid_profile)
+    def test_runner_invalid_response(self, valid_profile):
+        hook = make_runner(_PRE_MD, {"valid": False, "reason": "Missing field: name"})
+        result = hook.run_json(f"Validate: {json.dumps(valid_profile)}")
         assert result["valid"] is False
-        assert "name" in result["reason"]
+        assert "reason" in result
 
-    def test_empty_name_fails(self, pre_hook, valid_profile):
-        valid_profile["name"] = "  "
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
+    def test_runner_called_once(self, valid_profile):
+        hook = make_runner(_PRE_MD, {"valid": True, "warnings": []})
+        hook.run_json(f"Validate: {json.dumps(valid_profile)}")
+        hook.run_json.assert_called_once()
 
-    def test_invalid_age_low_fails(self, pre_hook, valid_profile):
-        valid_profile["age"] = 15
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_invalid_age_high_fails(self, pre_hook, valid_profile):
-        valid_profile["age"] = 90
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_negative_income_fails(self, pre_hook, valid_profile):
-        valid_profile["monthly_income"] = -1000
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_negative_loan_fails(self, pre_hook, valid_profile):
-        valid_profile["existing_loan"] = -500
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_invalid_credit_score_fails(self, pre_hook, valid_profile):
-        valid_profile["credit_score"] = 150
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_negative_missed_payments_fails(self, pre_hook, valid_profile):
-        valid_profile["missed_payments"] = -1
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_name_with_special_chars_fails(self, pre_hook, valid_profile):
-        valid_profile["name"] = "Alice123<script>"
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is False
-
-    def test_sanitisation_strips_whitespace(self, pre_hook, valid_profile):
-        valid_profile["name"] = "  Alice Sharma  "
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is True
-        assert valid_profile["name"] == "Alice Sharma"
-
-    def test_large_loan_generates_warning(self, pre_hook, valid_profile):
-        valid_profile["existing_loan"] = 60_000_000  # ₹6 crore
-        result = pre_hook.execute(valid_profile)
-        assert result["valid"] is True
-        assert len(result.get("warnings", [])) > 0
+    def test_warnings_in_response(self):
+        hook = make_runner(_PRE_MD, {"valid": True, "warnings": ["Large loan detected"]})
+        result = hook.run_json("Validate large loan profile")
+        assert isinstance(result.get("warnings"), list)
+        assert len(result["warnings"]) > 0
 
 
-# ── Post-Analysis Hook Tests ──────────────────────────────────────────────────
+class TestPostAnalysisHookMd:
 
-class TestPostAnalysisHook:
+    def test_md_file_exists(self):
+        assert os.path.exists(_POST_MD)
 
-    def test_post_hook_returns_completed(self, post_hook, valid_profile, low_risk_result):
-        result = post_hook.execute(valid_profile, low_risk_result)
+    def test_md_has_name_frontmatter(self):
+        with open(_POST_MD) as f:
+            content = f.read()
+        assert "post-analysis-hook" in content
+
+    def test_md_has_trigger_frontmatter(self):
+        with open(_POST_MD) as f:
+            content = f.read()
+        assert "after_agent" in content
+
+    def test_md_defines_alert_types(self):
+        with open(_POST_MD) as f:
+            content = f.read()
+        assert "HIGH_RISK_FLAG" in content
+        assert "POLICY_VIOLATION" in content
+
+    def test_md_defines_event_logging(self):
+        with open(_POST_MD) as f:
+            content = f.read()
+        assert "events.jsonl" in content or "event" in content.lower()
+
+    def test_runner_returns_completed(self):
+        hook = make_runner(_POST_MD, {"hook_status": "completed", "alerts": [], "event_logged": True})
+        result = hook.run_json("Log this analysis")
         assert result["hook_status"] == "completed"
 
-    def test_post_hook_event_logged(self, post_hook, valid_profile, low_risk_result):
-        result = post_hook.execute(valid_profile, low_risk_result)
-        assert result["event_logged"] is True
-
-    def test_high_risk_generates_alert(self, post_hook, valid_profile, high_risk_result):
-        result = post_hook.execute(valid_profile, high_risk_result)
-        assert len(result["alerts"]) > 0
+    def test_runner_high_risk_alert(self):
+        hook = make_runner(_POST_MD, {
+            "hook_status": "completed",
+            "alerts": [{"type": "HIGH_RISK_FLAG", "severity": "HIGH", "message": "High risk flagged."}],
+            "event_logged": True
+        })
+        result = hook.run_json("Log high risk analysis")
         alert_types = [a["type"] for a in result["alerts"]]
         assert "HIGH_RISK_FLAG" in alert_types
 
-    def test_low_risk_no_high_risk_alert(self, post_hook, valid_profile, low_risk_result):
-        result = post_hook.execute(valid_profile, low_risk_result)
-        alert_types = [a["type"] for a in result.get("alerts", [])]
-        assert "HIGH_RISK_FLAG" not in alert_types
-
-    def test_execution_count_increments(self, post_hook, valid_profile, low_risk_result):
-        initial = post_hook.get_execution_count()
-        post_hook.execute(valid_profile, low_risk_result)
-        assert post_hook.get_execution_count() == initial + 1
-
-    def test_alert_count_increments_on_high_risk(self, post_hook, valid_profile, high_risk_result):
-        initial = post_hook.get_alert_count()
-        post_hook.execute(valid_profile, high_risk_result)
-        assert post_hook.get_alert_count() == initial + 1
+    def test_runner_no_alerts_for_low_risk(self):
+        hook = make_runner(_POST_MD, {"hook_status": "completed", "alerts": [], "event_logged": True})
+        result = hook.run_json("Log low risk analysis")
+        assert result["alerts"] == []

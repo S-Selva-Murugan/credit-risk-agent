@@ -9,14 +9,19 @@ import datetime
 import sys
 import os
 
+# Load .env file if present (ANTHROPIC_API_KEY)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agents.orchestrator_agent import OrchestratorAgent
+from agents.agent_runner import AgentRunner
 from observability.tracer import Tracer
 from observability.metrics import MetricsCollector
 from governance.policy_engine import PolicyEngine
-from hooks.pre_analysis_hook import PreAnalysisHook
-from hooks.post_analysis_hook import PostAnalysisHook
 from data.sample_profiles import SAMPLE_PROFILES
 
 st.set_page_config(
@@ -562,17 +567,23 @@ section[data-testid="stSidebar"] .stButton > button:hover {
 """, unsafe_allow_html=True)
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
+_AGENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents")
+_HOOKS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks")
+
 @st.cache_resource
 def initialize_components():
     tracer        = Tracer()
     metrics       = MetricsCollector()
     policy_engine = PolicyEngine()
-    orchestrator  = OrchestratorAgent(tracer=tracer, metrics=metrics, policy_engine=policy_engine)
-    pre_hook      = PreAnalysisHook()
-    post_hook     = PostAnalysisHook()
-    return orchestrator, tracer, metrics, policy_engine, pre_hook, post_hook
+    # Each agent is just its .md file — AgentRunner reads the system prompt and calls Claude
+    risk_agent    = AgentRunner(os.path.join(_AGENTS_DIR, "risk_scoring_agent.md"),   tracer=tracer)
+    explain_agent = AgentRunner(os.path.join(_AGENTS_DIR, "explanation_agent.md"),    tracer=tracer)
+    audit_agent   = AgentRunner(os.path.join(_AGENTS_DIR, "audit_agent.md"),          tracer=tracer)
+    pre_hook      = AgentRunner(os.path.join(_HOOKS_DIR,  "pre_analysis_hook.md"),    tracer=tracer)
+    post_hook     = AgentRunner(os.path.join(_HOOKS_DIR,  "post_analysis_hook.md"),   tracer=tracer)
+    return risk_agent, explain_agent, audit_agent, pre_hook, post_hook, tracer, metrics, policy_engine
 
-orchestrator, tracer, metrics, policy_engine, pre_hook, post_hook = initialize_components()
+risk_agent, explain_agent, audit_agent, pre_hook, post_hook, tracer, metrics, policy_engine = initialize_components()
 
 # ─── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -584,7 +595,24 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-section">Sample Profiles</div>', unsafe_allow_html=True)
+    # ── API Key ────────────────────────────────────────────────────────
+    st.markdown('<div class="sidebar-section">Anthropic API Key</div>', unsafe_allow_html=True)
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key_input = st.text_input(
+        "API Key",
+        value=env_key,
+        type="password",
+        placeholder="sk-ant-... or ghp-...",
+        label_visibility="collapsed",
+        help="Your Anthropic API key. Set ANTHROPIC_API_KEY in .env to avoid entering it each time."
+    )
+    if api_key_input:
+        os.environ["ANTHROPIC_API_KEY"] = api_key_input
+        st.markdown('<div style="font-size:0.73rem;color:#22c55e;padding:2px 0 6px;">✓ Key loaded</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="font-size:0.73rem;color:#f87171;padding:2px 0 6px;">⚠ No API key set</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-section" style="margin-top:0.5rem;">Sample Profiles</div>', unsafe_allow_html=True)
 
     risk_icons = {
         "Low Risk":    "🟢",
@@ -740,17 +768,85 @@ if run:
         "analysis_timestamp": datetime.datetime.now().isoformat()
     }
 
-    with st.spinner("Running agent pipeline…"):
-        hook_result = pre_hook.execute(profile)
-        if not hook_result["valid"]:
-            st.error(f"Validation error: {hook_result['reason']}")
-            st.stop()
-        t0     = time.time()
-        result = orchestrator.analyse(profile)
-        elapsed = time.time() - t0
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        st.error("No Anthropic API key set. Enter your key in the sidebar first.")
+        st.stop()
 
-    post_hook.execute(profile, result)
-    metrics.record_analysis(result["risk_level"], elapsed)
+    with st.spinner("🔧 Pre-analysis hook validating input…"):
+        hook_result = pre_hook.run_json(
+            f"Validate this customer profile and return JSON.\n\n{json.dumps(profile, indent=2)}"
+        )
+        if not hook_result.get("valid", True):
+            st.error(f"Validation error: {hook_result.get('reason')}")
+            st.stop()
+
+    import uuid, datetime as _dt
+    audit_id   = f"AUD-{uuid.uuid4().hex[:10].upper()}"
+    session_id = str(uuid.uuid4())
+
+    with st.spinner("🤖 Risk Scoring Agent analysing profile…"):
+        t0          = time.time()
+        risk_result = risk_agent.run_json(
+            f"Score this customer profile. Return ONLY JSON.\n\n{json.dumps(profile, indent=2)}"
+        )
+
+    with st.spinner("💡 Explanation Agent generating reasoning…"):
+        exp_result = explain_agent.run_json(
+            f"Generate an explanation. Return ONLY JSON.\n\n"
+            f"Customer Profile:\n{json.dumps(profile, indent=2)}\n\n"
+            f"Risk Result:\n{json.dumps(risk_result, indent=2)}"
+        )
+
+    elapsed = time.time() - t0
+
+    # Decision from risk score
+    score = risk_result.get("risk_score", 50)
+    if score <= 35:
+        decision, rate_band = "Approve", "8.5% – 10.5% p.a."
+    elif score <= 65:
+        decision, rate_band = "Review",  "11.0% – 14.5% p.a."
+    else:
+        decision, rate_band = "Reject",  "N/A – Not Eligible"
+
+    # Governance policy check (pure Python — no Claude needed)
+    governance = policy_engine.check(profile, risk_result)
+    governance["audit_id"] = audit_id
+
+    # Post-analysis hook (fire-and-forget, non-blocking)
+    try:
+        post_hook.run_json(
+            f"Log this completed analysis. Return JSON.\n\n"
+            f"Customer: {profile['name']}\n"
+            f"Risk: {risk_result.get('risk_level')} | Score: {score} | Decision: {decision}\n"
+            f"Audit ID: {audit_id}"
+        )
+    except Exception:
+        pass  # Never block the UI for a logging hook
+
+    # Audit agent — persist record (fire-and-forget)
+    try:
+        audit_agent.run_json(
+            f"Create and persist an audit record. Return JSON.\n\n"
+            f"Audit ID: {audit_id}\nSession: {session_id}\n"
+            f"Customer name hash: CUST-{abs(hash(profile['name'])) % 1_000_000:06d}\n"
+            f"Risk: {risk_result.get('risk_level')} | Score: {score} | Decision: {decision}\n"
+            f"Policy compliant: {governance['policy_compliant']}"
+        )
+    except Exception:
+        pass
+
+    metrics.record_analysis(risk_result.get("risk_level", "Unknown"), elapsed)
+
+    result = {
+        "risk_level":         risk_result.get("risk_level", "Unknown"),
+        "risk_score":         risk_result.get("risk_score", 0),
+        "explanation":        exp_result.get("summary", ""),
+        "factors":            exp_result.get("factors", []),
+        "decision":           decision,
+        "interest_rate_band": rate_band,
+        "governance":         governance,
+        "trace":              tracer.get_trace()
+    }
 
     # ── store for display
     risk_level = result["risk_level"]
