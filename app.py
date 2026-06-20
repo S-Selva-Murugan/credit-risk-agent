@@ -576,11 +576,11 @@ def initialize_components():
     metrics       = MetricsCollector()
     policy_engine = PolicyEngine()
     # Each agent is just its .md file — AgentRunner reads the system prompt and calls Claude
-    risk_agent    = AgentRunner(os.path.join(_AGENTS_DIR, "risk_scoring_agent.md"),   tracer=tracer)
-    explain_agent = AgentRunner(os.path.join(_AGENTS_DIR, "explanation_agent.md"),    tracer=tracer)
-    audit_agent   = AgentRunner(os.path.join(_AGENTS_DIR, "audit_agent.md"),          tracer=tracer)
-    pre_hook      = AgentRunner(os.path.join(_HOOKS_DIR,  "pre_analysis_hook.md"),    tracer=tracer)
-    post_hook     = AgentRunner(os.path.join(_HOOKS_DIR,  "post_analysis_hook.md"),   tracer=tracer)
+    risk_agent    = AgentRunner(os.path.join(_AGENTS_DIR, "risk_scoring_agent.md"),   tracer=tracer, metrics=metrics)
+    explain_agent = AgentRunner(os.path.join(_AGENTS_DIR, "explanation_agent.md"),    tracer=tracer, metrics=metrics)
+    audit_agent   = AgentRunner(os.path.join(_AGENTS_DIR, "audit_agent.md"),          tracer=tracer, metrics=metrics)
+    pre_hook      = AgentRunner(os.path.join(_HOOKS_DIR,  "pre_analysis_hook.md"),    tracer=tracer, metrics=metrics)
+    post_hook     = AgentRunner(os.path.join(_HOOKS_DIR,  "post_analysis_hook.md"),   tracer=tracer, metrics=metrics)
     return risk_agent, explain_agent, audit_agent, pre_hook, post_hook, tracer, metrics, policy_engine
 
 risk_agent, explain_agent, audit_agent, pre_hook, post_hook, tracer, metrics, policy_engine = initialize_components()
@@ -771,6 +771,8 @@ if run:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.error("No Anthropic API key set. Enter your key in the sidebar first.")
         st.stop()
+
+    metrics.record_request()
 
     with st.spinner("🔧 Pre-analysis hook validating input…"):
         hook_result = pre_hook.run_json(

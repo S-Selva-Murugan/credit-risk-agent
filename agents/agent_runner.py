@@ -39,9 +39,10 @@ class AgentRunner:
 
     DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
-    def __init__(self, md_path: str, tracer=None):
+    def __init__(self, md_path: str, tracer=None, metrics=None):
         self.md_path = md_path
-        self.tracer  = tracer
+        self.tracer   = tracer
+        self.metrics  = metrics
 
         # Load and parse the .md definition
         with open(md_path, "r", encoding="utf-8") as f:
@@ -73,6 +74,13 @@ class AgentRunner:
         )
 
         response = message.content[0].text
+
+        if self.metrics and hasattr(message, "usage") and message.usage:
+            self.metrics.record_tokens(
+                self.name,
+                message.usage.input_tokens,
+                message.usage.output_tokens,
+            )
 
         if self.tracer:
             self.tracer.log(agent=self.name, message=f"Response received ({len(response)} chars)")

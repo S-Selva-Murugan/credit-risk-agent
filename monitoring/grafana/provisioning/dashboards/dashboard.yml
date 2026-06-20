@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: 'CreditIQ'
+    orgId: 1
+    folder: 'CreditIQ'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /home/labuser/CapstoneProject/credit-risk-agent/monitoring/grafana/provisioning/dashboards
